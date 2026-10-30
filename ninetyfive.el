@@ -149,8 +149,13 @@ Values:
 (defvar ninetyfive--buffer-content-sent nil
   "Whether initial file content has been sent for current buffer.")
 
+(defvar ninetyfive--pre-change-byte-size nil
+  "Byte size of the whole buffer just before the change in progress.
+Recorded by `ninetyfive--before-change-hook' so that the after-change
+hook can work out how many bytes the change replaced.")
+
 (defvar ninetyfive--buffer-local-vars
-  '(ninetyfive--buffer-content-sent)
+  '(ninetyfive--buffer-content-sent ninetyfive--pre-change-byte-size)
   "List of buffer-local variables.")
 
 (defvar ninetyfive--inhibit-after-change nil
@@ -173,12 +178,21 @@ Values:
   (if (and ninetyfive--last-buffer
            (buffer-live-p ninetyfive--last-buffer))
       (with-current-buffer ninetyfive--last-buffer
-        (buffer-substring-no-properties (point-min) (point-max)))
+        ;; The server's copy is always the whole buffer, ignoring narrowing.
+        (save-restriction
+          (widen)
+          (buffer-substring-no-properties (point-min) (point-max))))
     "")) ;; return empty
 
-(defun ninetyfive--get-text-to-cursor ()
-  "Get text from beginning of buffer to current cursor position."
-  (buffer-substring-no-properties (point-min) (point)))
+(defun ninetyfive--byte-offset (pos)
+  "Return the server-side byte offset of buffer position POS.
+Offsets count UTF-8 bytes from the start of the whole buffer, ignoring
+any narrowing, to match the text sent by `ninetyfive--send-file-content'."
+  (1- (position-bytes pos)))
+
+(defun ninetyfive--buffer-byte-size ()
+  "Return the size in bytes of the whole current buffer."
+  (ninetyfive--byte-offset (1+ (buffer-size))))
 
 (defun ninetyfive--debug-message (format-string &rest args)
   "Display debug message if debug messages are enabled."
@@ -191,30 +205,39 @@ Values:
     (let ((json-string (json-encode message)))
       (websocket-send-text ninetyfive--websocket json-string))))
 
-(defun ninetyfive--send-delta-from-change (start end text)
-  "Send delta message using change information from after-change-functions.
-START and END are buffer positions, TEXT is the replacement text."
+(defun ninetyfive--send-delta-from-change (start end old-length)
+  "Send a delta for a change reported by `after-change-functions'.
+START and END delimit the new text in the changed buffer and OLD-LENGTH
+is the length in characters of the text it replaced, as passed to
+`after-change-functions'.  The delta's start and end are byte offsets
+into the server's copy of the buffer from before the change."
   (when ninetyfive--connected
-    (if (not ninetyfive--buffer-content-sent)
-        ;; First time - send full content
-        (progn
-          (ninetyfive--send-file-content)
-          (setq ninetyfive--buffer-content-sent t))
-      
-      ;; Send delta using the change information directly
-      ;; Convert buffer positions to byte positions
-      (let ((byte-start (string-bytes (buffer-substring-no-properties (point-min) start)))
-            (byte-end (string-bytes (buffer-substring-no-properties (point-min) end))))
-        
-        (ninetyfive--debug-message "Sending file delta - start: %d, end: %d, text length: %d"
-                                   byte-start byte-end (length text))
-        
-        ;; Send delta message
-        (let ((message `((type . "file-delta")
-                         (start . ,byte-start)
-                         (end . ,byte-end)
-                         (text . ,text))))
-          (ninetyfive--send-message message))))))
+    (let* ((byte-start (ninetyfive--byte-offset start))
+           (new-bytes (- (ninetyfive--byte-offset end) byte-start))
+           ;; Everything before START and after END is unchanged, so the
+           ;; replaced text's byte length is the new text's byte length
+           ;; plus however much the buffer shrank.
+           (old-bytes (and ninetyfive--pre-change-byte-size
+                           (+ new-bytes
+                              (- ninetyfive--pre-change-byte-size
+                                 (ninetyfive--buffer-byte-size))))))
+      (setq ninetyfive--pre-change-byte-size nil)
+      (if (or (not ninetyfive--buffer-content-sent)
+              ;; Missing or inconsistent before-change data (a change
+              ;; that bypassed the hooks): resynchronise from scratch.
+              (null old-bytes)
+              (< old-bytes old-length))
+          (progn
+            (ninetyfive--send-file-content)
+            (setq ninetyfive--buffer-content-sent t))
+        (let ((text (buffer-substring-no-properties start end))
+              (byte-end (+ byte-start old-bytes)))
+          (ninetyfive--debug-message "Sending file delta - start: %d, end: %d, text length: %d"
+                                     byte-start byte-end (length text))
+          (ninetyfive--send-message `((type . "file-delta")
+                                      (start . ,byte-start)
+                                      (end . ,byte-end)
+                                      (text . ,text))))))))
 
 (defun ninetyfive--calculate-and-send-delta ()
   "Send file content for buffers that haven't been sent yet."
@@ -251,8 +274,7 @@ START and END are buffer positions, TEXT is the replacement text."
 
 (defun ninetyfive--send-delta-completion-request ()
   "Send delta completion request to the server."
-  (let* ((text-to-cursor (ninetyfive--get-text-to-cursor))
-         (byte-length (string-bytes text-to-cursor))
+  (let* ((byte-length (ninetyfive--byte-offset (point)))
          (request-id (ninetyfive--generate-request-id))
          (completion-message `((type . "delta-completion-request")
                                (requestId . ,request-id)
@@ -451,13 +473,24 @@ START and END are buffer positions, TEXT is the replacement text."
     (ninetyfive--send-set-workspace)
     (ninetyfive--on-file-opened)))
 
-(defun ninetyfive--after-change-hook (start end _old-length)
+(defun ninetyfive--before-change-hook (_beg _end)
+  "Hook function for `before-change-functions'.
+Record the buffer's byte size so the after-change hook can compute the
+byte length of the replaced text."
+  (setq ninetyfive--pre-change-byte-size (ninetyfive--buffer-byte-size)))
+
+(defun ninetyfive--after-change-hook (start end old-length)
   "Hook function for after-change-functions to send deltas and request completions.
-START and END are the beginning and end of region just changed."
+START and END are the beginning and end of region just changed and
+OLD-LENGTH is the length of the text it replaced."
   (when ninetyfive--connected
-    (let ((text (buffer-substring-no-properties start end)))
-      (ninetyfive--send-delta-from-change start end text)
+    ;; Modification hooks must not clobber the match data (`kbd' in
+    ;; `ninetyfive--clear-completion' does), or `replace-match' fails.
+    (save-match-data
+      ;; Set before sending: if this is the buffer's first change, the
+      ;; full content sent for it must come from this buffer.
       (setq ninetyfive--last-buffer (current-buffer))
+      (ninetyfive--send-delta-from-change start end old-length)
 
       (ninetyfive--clear-completion)
 
@@ -552,6 +585,7 @@ START and END are the beginning and end of region just changed."
   (if ninetyfive-mode
       (progn
         (add-hook 'find-file-hook #'ninetyfive--find-file-hook nil t)
+        (add-hook 'before-change-functions #'ninetyfive--before-change-hook nil t)
         (add-hook 'after-change-functions #'ninetyfive--after-change-hook nil t)
         (add-hook 'buffer-list-update-hook #'ninetyfive--maybe-set-last-buffer nil t)
         (add-hook 'post-command-hook #'ninetyfive--maybe-clear-on-cursor-move nil t)
@@ -568,9 +602,10 @@ START and END are the beginning and end of region just changed."
           (ninetyfive--on-file-opened)))
 
     (remove-hook 'find-file-hook #'ninetyfive--find-file-hook t)
+    (remove-hook 'before-change-functions #'ninetyfive--before-change-hook t)
     (remove-hook 'after-change-functions #'ninetyfive--after-change-hook t)
-    (remove-hook 'buffer-list-update-hook #'ninetyfive--maybe-set-last-buffer nil t)
-    (remove-hook 'post-command-hook #'ninetyfive--maybe-clear-on-cursor-move nil t)
+    (remove-hook 'buffer-list-update-hook #'ninetyfive--maybe-set-last-buffer t)
+    (remove-hook 'post-command-hook #'ninetyfive--maybe-clear-on-cursor-move t)
 
     (ninetyfive--clear-completion)
     (setq ninetyfive--completion-text "")
