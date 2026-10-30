@@ -569,8 +569,8 @@ START and END are the beginning and end of region just changed."
 
     (remove-hook 'find-file-hook #'ninetyfive--find-file-hook t)
     (remove-hook 'after-change-functions #'ninetyfive--after-change-hook t)
-    (remove-hook 'buffer-list-update-hook #'ninetyfive--maybe-set-last-buffer nil t)
-    (remove-hook 'post-command-hook #'ninetyfive--maybe-clear-on-cursor-move nil t)
+    (remove-hook 'buffer-list-update-hook #'ninetyfive--maybe-set-last-buffer t)
+    (remove-hook 'post-command-hook #'ninetyfive--maybe-clear-on-cursor-move t)
 
     (ninetyfive--clear-completion)
     (setq ninetyfive--completion-text "")
